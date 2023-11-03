@@ -162,3 +162,4 @@ cython_debug/
 # yfpy stuff
 auth/private.json
 auth/token.json
+test_fantasy_tool.ipynb
