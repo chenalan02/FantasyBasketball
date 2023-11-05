@@ -11,6 +11,8 @@ from yfpy.query import YahooFantasySportsQuery
 from nba_api.stats.endpoints import PlayerGameLog
 from nba_api.stats.static import players, teams
 
+POSITIONS = ['PG', 'SG', 'SF', 'PF', 'C']
+
 class Normal_Dist:
     def __init__(self, samples=None, num_samples=None, mean=None, variance=None, sd=None):
         if samples:
@@ -39,16 +41,38 @@ class Normal_Dist:
         sd = np.sqrt(variance)
 
         return Normal_Dist(num_samples=num_samples, mean=mean, variance=variance, sd=sd)
+    
+    def __add__(self, other):
+        
+        mean = self.mean + other.mean
+        variance = self.variance + other.variance
+        sd = np.sqrt(variance)
 
-class Player:
+        return Normal_Dist(mean=mean, variance=variance, sd=sd)
+    
+    def __sub__(self, other):
+        
+        mean = self.mean - other.mean
+        variance = self.variance + other.variance
+        sd = np.sqrt(variance)
+
+        return Normal_Dist(mean=mean, variance=variance, sd=sd)
+    
+    def __mul__(self, n):
+            
+        mean = self.mean * n
+        variance = self.variance * n
+        sd = np.sqrt(variance)
+
+        return Normal_Dist(mean=mean, variance=variance, sd=sd)
+
+
+class NBAPlayer:
     def __init__(self, full_name, id, position):
         self.full_name = full_name
         self.id = id
         self.position = position
-        self.categories = {}
-
-    def calculate_dist(query, category):
-        pass
+        self.category_dists = {}
 
     def get_category_dists(self, categories, w1=0.6, w2=0.4, min_mins=7, cume_stats_vs_teams=None, cume_stats_by_location=None):
         start = time.time()
@@ -62,9 +86,9 @@ class Player:
             for cat in categories:
                 cume_stats[cat].append(game[cat])
                 if cume_stats_vs_teams:
-                    cume_stats_vs_teams[opponent][cat].append(game[cat])
+                    cume_stats_vs_teams[opponent][cat][self.position].append(game[cat])
                 if cume_stats_by_location:
-                    cume_stats_by_location[location][cat].append(game[cat])
+                    cume_stats_by_location[location][self.position][cat].append(game[cat])
         
         for game in PlayerGameLog(player_id=self.id, season='2022').get_normalized_dict()["PlayerGameLog"]:
             if game['MIN'] < min_mins:
@@ -73,27 +97,28 @@ class Player:
             for cat in categories:
                 cume_stats_prev_season[cat].append(game[cat])
                 if cume_stats_vs_teams:
-                    cume_stats_vs_teams[opponent][cat].append(game[cat])
+                    cume_stats_vs_teams[opponent][cat][self.position].append(game[cat])
                 if cume_stats_by_location:
-                    cume_stats_by_location[location][cat].append(game[cat])
+                    cume_stats_by_location[location][cat][self.position].append(game[cat])
 
         for cat in categories:
             current_season_dist = Normal_Dist(samples=cume_stats[cat])
             prev_season_dist = Normal_Dist(samples=cume_stats_prev_season[cat])
-            self.categories[cat] = Normal_Dist.weighted_sum(prev_season_dist, current_season_dist, w1, w2)
+            self.category_dists[cat] = Normal_Dist.weighted_sum(prev_season_dist, current_season_dist, w1, w2)
 
         end = time.time()
         duration = end - start
         if duration < 0.6:
             time.sleep(0.6 - duration)
 
-class Team:
-    def __init__(self, owner_id):
+class FantasyTeam:
+    def __init__(self, owner_id, owner_nickname):
         self.owner_id = owner_id
+        self.owner_nickname = owner_nickname
         self.players = []
-        self.category_rankings = {}
+        self.summed_category_dists = {}
 
-class League:
+class FantasyLeague:
     def __init__(self, auth_dir, league_id, game_id, categories):
 
         with open(path.join(auth_dir, r"private.json")) as f:
@@ -109,13 +134,33 @@ class League:
                                 consumer_secret=private["consumer_secret"],
                                 browser_callback=True)
         self.categories = categories
-        
-        self.cume_stats_vs_teams = {t['abbreviation']:{c:[] for c in categories} for t in teams.get_teams()}
-        self.cume_stats_by_location = {l:{c:[] for c in categories} for l in ['vs.', '@']}
-        self.players = [Player(p.full_name, find_nba_player_id(p.full_name), p.primary_position) for p in self.yahoo_query.get_league_players()]
-        self.players = [p for p in self.players if p.id != None]
-        for player in self.players:
-            player.get_category_dists(categories, 0.5, 0.5, 7, self.cume_stats_vs_teams, self.cume_stats_by_location)
+
+        self.cume_stats_vs_teams = {t['abbreviation']:{p:{c:[] for c in categories} for p in POSITIONS} for t in teams.get_teams()}
+        self.cume_stats_by_location = {l:{p:{c:[] for c in categories} for p in POSITIONS} for l in ['vs.', '@']}
+        self.nba_players = []
+        self.fantasy_teams = []
+
+    def calc_players_stats(self):
+
+        self.nba_players = [NBAPlayer(p.full_name, find_nba_player_id(p.full_name), p.primary_position) for p in self.yahoo_query.get_league_players()]
+        self.nba_players = [p for p in self.nba_players if p.id != None]
+        for player in self.nba_players:
+            player.get_category_dists(self.categories, 0.5, 0.5, 7, self.cume_stats_vs_teams, self.cume_stats_by_location)
+
+    def get_fantasy_teams(self):
+        self.fantasy_teams = [FantasyTeam(t.team_id, t.name) for t in self.yahoo_query.get_league_teams()]
+        for team in self.fantasy_teams:
+            team.players = [p for p in self.nba_players if p.id in [p.id for p in self.yahoo_query.get_team_roster(team.owner_id)]]
+
+    def save_players_stats(self, save_path):
+        with open(save_path, 'w') as f:
+            json.dump({p.id: {c:{'mean': p.categories[c].mean, 'sd': p.categories[c].sd} for c in p.categories} for p in self.nba_players}, f)
+
+    def load_player_stats(self, save_path):
+        with open(save_path) as f:
+            player_stats = json.load(f)
+        for player in self.nba_players:
+            player.categories = {c:Normal_Dist(mean=player_stats[player.id][c]['mean'], sd=player_stats[player.id][c]['sd']) for c in self.categories}
 
 def find_nba_player_id(full_name):
     nba_players = players.get_players()
@@ -130,9 +175,14 @@ def find_nba_player_id(full_name):
 
     else:
         return None
-while __name__ != "__main__":
+
+
+while __name__ == "__main__":
+
     CATEGORIES = ['PTS', 'REB', 'AST', 'STL', 'BLK', 'TOV', 'FG3M', 'FGM', 'FGA', 'FTM', 'FTA']
     auth_dir = r"auth/"
     league_id = r"101582"
     game_id = 428
-    leauge = League(auth_dir, league_id, game_id, CATEGORIES)
+    league = FantasyLeague(auth_dir, league_id, game_id, CATEGORIES)
+    league.save_players_stats(r"players_stats.json")    
+
